@@ -1,0 +1,74 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      PLUGIN: plugins/code-suite
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Validate marketplace and plugin manifests
+        run: |
+          claude plugin validate --strict .
+          claude plugin validate --strict "$PLUGIN"
+
+      # `claude plugin validate` only accepts a marketplace or plugin directory, so the
+      # skills/ and agents/ folders are checked here: each file needs a frontmatter
+      # block with a name matching its folder/file and a description.
+      - name: Validate skills and agents frontmatter
+        run: |
+          status=0
+          check() { # <file> <expected name>
+            awk -v want="$2" -v f="$1" '
+              NR == 1 && $0 != "---" { print f ": missing frontmatter"; bad = 1; exit }
+              NR > 1 && $0 == "---" { closed = 1; exit }
+              /^name:/        { sub(/^name:[ \t]*/, ""); name = $0 }
+              /^description:/ { desc = 1 }
+              END {
+                if (bad) exit 1
+                if (!closed)       { print f ": unterminated frontmatter"; exit 1 }
+                if (name != want)  { print f ": name \"" name "\" should be \"" want "\""; exit 1 }
+                if (!desc)         { print f ": missing description"; exit 1 }
+              }' "$1"
+          }
+          for f in "$PLUGIN"/skills/*/SKILL.md; do
+            check "$f" "$(basename "$(dirname "$f")")" || status=1
+          done
+          for f in "$PLUGIN"/agents/*.md; do
+            check "$f" "$(basename "$f" .md)" || status=1
+          done
+          exit $status
+
+      - name: Check shell scripts
+        run: |
+          status=0
+          for f in "$PLUGIN"/bin/* "$PLUGIN"/scripts/*.sh; do
+            [ -f "$f" ] || continue
+            bash -n "$f" || status=1
+            case "$f" in
+              */bin/*) [ -x "$f" ] || { echo "$f: not executable"; status=1; } ;;
+            esac
+          done
+          exit $status
+
+      - name: Validate JSON
+        run: |
+          for f in .claude-plugin/marketplace.json "$PLUGIN"/.claude-plugin/plugin.json "$PLUGIN"/hooks/hooks.json; do
+            jq empty "$f"
+            echo "$f ok"
+          done
