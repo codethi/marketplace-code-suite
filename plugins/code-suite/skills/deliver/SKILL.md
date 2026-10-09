@@ -8,7 +8,8 @@ argument-hint: "[summary | commit | pr]"
 
 Hand off finished work cleanly. By default, delivering means a clean diff and a clear
 summary. Committing, pushing and opening PRs happen only when the user asks for them
-(or the project instructions say to).
+(or the project instructions say to). On the orchestrator's code-changing routes, the
+orchestrator has already committed each task on `feat/<slug>`; only push and PR remain.
 
 Requested action: `$ARGUMENTS` (if empty: summary only).
 
@@ -16,7 +17,12 @@ Requested action: `$ARGUMENTS` (if empty: summary only).
 
 - Verification has run on the final state of the code and passed. If not, run the
   `verify` capability first. Do not deliver red work without saying so up front.
-- Inspect `git status` and the full `git diff`:
+- If the task has an evidence folder (`.code-suite/<slug>/`), `cs-evidence verify <slug>`
+  must exit 0 on the commit being delivered before any push or PR.
+- Before committing or opening a PR, run the `diff-review` capability
+  (`code-suite:diff-reviewer` when available) with the base and the plan, and resolve or
+  justify each finding. When it is unavailable, inspect `git status` and the full
+  `git diff` yourself:
   - Only intended files changed. No debug logs, scratch scripts, commented-out code,
     stray formatting churn, or unrelated edits.
   - No secrets, credentials, tokens, `.env` contents or personal data.

@@ -6,6 +6,21 @@ Capability names resolve through [capabilities.md](capabilities.md).
 
 Size S routes may collapse steps; size L routes must not skip any.
 
+### Risk overlay (code-changing routes: bug, feature, refactor, chore)
+
+The risk level from the orchestrator's section 3 adds steps to these routes; it never
+removes any. In doubt, use the stricter level.
+
+- **Low** — `plan` (a short task list is enough).
+- **Medium** — `spec` and `plan`.
+- **High** — `spec`, `plan`, `design` for every task with a pending decision, and a
+  mandatory security review in validation.
+
+On these routes, `verify` and `review` run as the validation block of the
+orchestrator's section 7, on the committed HEAD, with each result recorded by
+`cs-evidence`; `review` is therefore required at every size. The route is done only
+when `cs-evidence verify` passes.
+
 ---
 
 ## question
@@ -43,12 +58,16 @@ No edits. If the answer reveals a bug or a needed change, offer it as a next rou
    edge cases, and what is out of scope. Ask the user only about real decisions.
 3. `plan` — Break the work into ordered tasks. For each: files touched, how it is
    verified. Mark which tasks are independent. Size L → **approval gate** here.
-4. `implement` — Execute tasks in order. Independent tasks touching disjoint files may go
+4. `design` (only when a task hinges on a lasting choice between reasonable approaches) —
+   Record the decision as an ADR before implementing it and link it from the task.
+5. `implement` — Execute tasks in order. Independent tasks touching disjoint files may go
    to parallel subagents. Follow the conventions of the example found in step 1.
-5. `test` — Tests for the new behavior, including the edge cases from the spec.
-6. `verify` — Full verification commands.
-7. `review` (size M/L) — Independent review of the full diff against the spec/plan.
-8. `deliver` — Summarize; commit / open PR only if asked (gate for push/PR).
+6. `test` — Tests for the new behavior, including the edge cases from the spec.
+7. `spec-sync` (when there is a spec or existing docs cover the change) — Align the spec
+   and docs with what was built; report unexplained deviations as pending.
+8. `verify` — Full verification commands.
+9. `review` (size M/L) — Independent review of the full diff against the spec/plan.
+10. `deliver` — Summarize; commit / open PR only if asked (gate for push/PR).
 
 ---
 
@@ -58,11 +77,13 @@ No edits. If the answer reveals a bug or a needed change, offer it as a next rou
 2. `test` — **Safety net first.** Confirm existing tests cover the behavior being
    preserved; if not, add characterization tests before touching the code.
 3. `plan` (size M/L) — Sequence the change into steps that each leave the build green.
-4. `implement` — Apply step by step; run the safety-net tests after each step.
-5. `verify` — Full verification. Behavior must be unchanged: no test expectations edited
+4. `design` (only when the target structure is a lasting choice between reasonable
+   approaches) — Record it as an ADR before implementing and link it from the plan.
+5. `implement` — Apply step by step; run the safety-net tests after each step.
+6. `verify` — Full verification. Behavior must be unchanged: no test expectations edited
    unless the user agreed to a behavior change.
-6. `review` (size M/L) — Review focused on accidental behavior changes.
-7. **Report** — What moved where, and evidence that behavior is unchanged.
+7. `review` (size M/L) — Review focused on accidental behavior changes.
+8. **Report** — What moved where, and evidence that behavior is unchanged.
 
 ---
 

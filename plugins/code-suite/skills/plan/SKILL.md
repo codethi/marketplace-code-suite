@@ -25,6 +25,8 @@ Each task:
 - Is small enough to review as one diff (roughly one commit).
 - Includes its own tests; testing is not a separate final task.
 - Names the files it creates or changes.
+- Flags a lasting architectural choice it depends on, if any; that task gets an ADR via
+  the `design` capability (`code-suite:design` when available) before it is implemented.
 
 Order tasks so contracts come before their consumers: types/schemas/interfaces →
 core logic → wiring (routes, DI, config) → UI/CLI surface → docs. For refactors, every
