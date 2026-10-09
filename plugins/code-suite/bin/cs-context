@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# cs-context — deterministic, read-only repository context detection.
+#
+# Usage: cs-context [path]
+#
+# Prints key=value lines describing the repository that contains [path]
+# (default: the current directory). Needs only bash and git; never writes
+# to the repository (git runs with optional locks disabled).
+#
+# Keys: repo_root, branch, default_branch, tree_clean, stack, test_cmd,
+#       build_cmd, lint_cmd, remote_host, has_gh, has_az.
+# Empty value = not detected.
+
+set -u
+
+export GIT_OPTIONAL_LOCKS=0
+
+start_dir=${1:-.}
+cd "$start_dir" 2>/dev/null || { echo "cs-context: cannot access '$start_dir'" >&2; exit 1; }
+
+g() { git -C "$root" --no-optional-locks "$@" 2>/dev/null; }
+
+# --- repository -------------------------------------------------------------
+
+in_git=false
+if root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$root" ]; then
+  in_git=true
+else
+  root=$(pwd -P)
+fi
+
+branch=""
+default_branch=""
+tree_clean=""
+remote_host="nenhum"
+
+if $in_git; then
+  branch=$(g symbolic-ref --short -q HEAD) || branch="HEAD"
+
+  if ref=$(g symbolic-ref --short -q refs/remotes/origin/HEAD) && [ -n "$ref" ]; then
+    default_branch=${ref#origin/}
+  else
+    for b in main master develop; do
+      if g show-ref --verify --quiet "refs/heads/$b" ||
+         g show-ref --verify --quiet "refs/remotes/origin/$b"; then
+        default_branch=$b
+        break
+      fi
+    done
+  fi
+
+  if [ -z "$(g status --porcelain --untracked-files=normal)" ]; then
+    tree_clean=true
+  else
+    tree_clean=false
+  fi
+
+  remote_url=$(g remote get-url origin) || remote_url=""
+  if [ -z "$remote_url" ]; then
+    first_remote=$(g remote | head -n 1)
+    [ -n "$first_remote" ] && remote_url=$(g remote get-url "$first_remote")
+  fi
+  if [ -n "$remote_url" ]; then
+    case "$remote_url" in
+      *github.com[:/]*)                                    remote_host="github" ;;
+      *dev.azure.com[:/]*|*.visualstudio.com[:/]*)         remote_host="azure-devops" ;;
+      *gitlab*)                                            remote_host="gitlab" ;;
+      *)                                                   remote_host="outro" ;;
+    esac
+  fi
+fi
+
+# --- helpers ----------------------------------------------------------------
+
+has()  { [ -e "$root/$1" ]; }
+has_glob() {
+  local f
+  for f in "$root"/$1; do [ -e "$f" ] && return 0; done
+  return 1
+}
+file_has() { [ -f "$root/$1" ] && grep -Eq "$2" "$root/$1" 2>/dev/null; }
+
+# Prints "name<TAB>value" for each entry of the top-level "scripts" object of
+# a JSON file (package.json, composer.json). Non-string values print an empty
+# value. Pure awk, no jq/node.
+json_scripts() {
+  awk '
+    { buf = buf $0 "\n" }
+    END {
+      n = length(buf); depth = 0; in_scripts = 0; pending = ""
+      for (i = 1; i <= n; i++) {
+        c = substr(buf, i, 1)
+        if (c == "\"") {
+          s = ""
+          for (i++; i <= n; i++) {
+            c = substr(buf, i, 1)
+            if (c == "\\") { i++; s = s substr(buf, i, 1); continue }
+            if (c == "\"") break
+            s = s c
+          }
+          # key if the next significant char is ":"
+          j = i + 1
+          while (j <= n && substr(buf, j, 1) ~ /[ \t\r\n]/) j++
+          if (substr(buf, j, 1) == ":") {
+            key[depth] = s
+            if (in_scripts && depth == 2) pending = s
+            i = j
+          } else if (in_scripts && depth == 2 && pending != "") {
+            print pending "\t" s; pending = ""
+          }
+        } else if (c == "{" || c == "[") {
+          if (in_scripts && depth == 2 && pending != "") { print pending "\t"; pending = "" }
+          depth++
+          if (c == "{" && depth == 2 && key[1] == "scripts") in_scripts = 1
+        } else if (c == "}" || c == "]") {
+          if (depth == 2 && in_scripts) in_scripts = 0
+          depth--
+        }
+      }
+    }
+  ' "$1" 2>/dev/null
+}
+
+# script_value <scripts-dump> <name> -> exit 0 and print value if present
+script_value() {
+  printf '%s\n' "$1" | awk -F '\t' -v k="$2" '$1 == k { print $2; found = 1; exit } END { exit !found }'
+}
+
+# --- stack ------------------------------------------------------------------
+
+stack="desconhecida"
+if   has package.json;                                                   then stack="node"
+elif has pom.xml;                                                        then stack="java-maven"
+elif has build.gradle || has build.gradle.kts || has settings.gradle || has settings.gradle.kts
+                                                                         then stack="java-gradle"
+elif has_glob '*.sln' || has_glob '*.slnx' || has_glob '*.csproj' || has_glob '*.fsproj'
+                                                                         then stack="dotnet"
+elif has pyproject.toml || has setup.py || has setup.cfg || has requirements.txt || has Pipfile
+                                                                         then stack="python"
+elif has go.mod;                                                         then stack="go"
+elif has composer.json;                                                  then stack="php"
+elif has Gemfile;                                                        then stack="ruby"
+elif has Cargo.toml;                                                     then stack="rust"
+fi
+
+# --- commands ---------------------------------------------------------------
+
+test_cmd=""
+build_cmd=""
+lint_cmd=""
+
+case "$stack" in
+  node)
+    if   has pnpm-lock.yaml;                          then pm=pnpm
+    elif has yarn.lock;                               then pm=yarn
+    elif has package-lock.json || has npm-shrinkwrap.json; then pm=npm
+    elif file_has package.json '"packageManager"[[:space:]]*:[[:space:]]*"pnpm@'; then pm=pnpm
+    elif file_has package.json '"packageManager"[[:space:]]*:[[:space:]]*"yarn@'; then pm=yarn
+    else pm=npm
+    fi
+    scripts=$(json_scripts "$root/package.json")
+    if v=$(script_value "$scripts" test); then
+      case "$v" in *"no test specified"*) ;; *) test_cmd="$pm test" ;; esac
+    fi
+    script_value "$scripts" build >/dev/null && build_cmd="$pm run build"
+    script_value "$scripts" lint  >/dev/null && lint_cmd="$pm run lint"
+    ;;
+
+  java-maven)
+    if has mvnw; then mvn="./mvnw"; else mvn="mvn"; fi
+    test_cmd="$mvn test"
+    build_cmd="$mvn package -DskipTests"
+    if   file_has pom.xml 'spotless-maven-plugin';   then lint_cmd="$mvn spotless:check"
+    elif file_has pom.xml 'maven-checkstyle-plugin'; then lint_cmd="$mvn checkstyle:check"
+    fi
+    ;;
+
+  java-gradle)
+    if has gradlew; then gradle="./gradlew"; else gradle="gradle"; fi
+    test_cmd="$gradle test"
+    build_cmd="$gradle assemble"
+    for f in build.gradle build.gradle.kts; do
+      if   file_has "$f" 'spotless';   then lint_cmd="$gradle spotlessCheck"; break
+      elif file_has "$f" 'checkstyle'; then lint_cmd="$gradle checkstyleMain"; break
+      fi
+    done
+    ;;
+
+  dotnet)
+    test_cmd="dotnet test"
+    build_cmd="dotnet build"
+    lint_cmd="dotnet format --verify-no-changes"
+    ;;
+
+  python)
+    if   has uv.lock;     then run="uv run "
+    elif has poetry.lock; then run="poetry run "
+    elif has Pipfile.lock; then run="pipenv run "
+    else run=""
+    fi
+    if has pytest.ini || has conftest.py ||
+       file_has pyproject.toml '^\[tool\.pytest' || file_has setup.cfg '^\[tool:pytest\]' ||
+       file_has tox.ini '^\[pytest\]' || file_has pyproject.toml 'pytest' ||
+       file_has requirements.txt '^pytest' || file_has requirements-dev.txt '^pytest'; then
+      test_cmd="${run}pytest"
+    fi
+    file_has pyproject.toml '^\[build-system\]' && build_cmd="${run}python -m build"
+    if has ruff.toml || has .ruff.toml || file_has pyproject.toml '^\[tool\.ruff'; then
+      lint_cmd="${run}ruff check ."
+    elif has .flake8 || file_has setup.cfg '^\[flake8\]' || file_has tox.ini '^\[flake8\]'; then
+      lint_cmd="${run}flake8"
+    fi
+    ;;
+
+  go)
+    test_cmd="go test ./..."
+    build_cmd="go build ./..."
+    if has_glob '.golangci.*'; then lint_cmd="golangci-lint run"; else lint_cmd="go vet ./..."; fi
+    ;;
+
+  php)
+    scripts=$(json_scripts "$root/composer.json")
+    if script_value "$scripts" test >/dev/null; then
+      test_cmd="composer test"
+    elif has tests/Pest.php; then
+      test_cmd="vendor/bin/pest"
+    elif has phpunit.xml || has phpunit.xml.dist; then
+      test_cmd="vendor/bin/phpunit"
+    fi
+    script_value "$scripts" build >/dev/null && build_cmd="composer run-script build"
+    if script_value "$scripts" lint >/dev/null; then
+      lint_cmd="composer run-script lint"
+    elif has phpstan.neon || has phpstan.neon.dist; then
+      lint_cmd="vendor/bin/phpstan analyse"
+    elif has .php-cs-fixer.php || has .php-cs-fixer.dist.php; then
+      lint_cmd="vendor/bin/php-cs-fixer fix --dry-run --diff"
+    fi
+    ;;
+
+  ruby)
+    if has .rspec || has spec; then
+      test_cmd="bundle exec rspec"
+    elif has Rakefile && has test; then
+      test_cmd="bundle exec rake test"
+    fi
+    for f in "$root"/*.gemspec; do
+      [ -e "$f" ] && { build_cmd="gem build $(basename "$f")"; break; }
+    done
+    has .rubocop.yml && lint_cmd="bundle exec rubocop"
+    ;;
+
+  rust)
+    test_cmd="cargo test"
+    build_cmd="cargo build"
+    lint_cmd="cargo clippy"
+    ;;
+esac
+
+# --- tooling ----------------------------------------------------------------
+
+if command -v gh >/dev/null 2>&1; then has_gh=true; else has_gh=false; fi
+if command -v az >/dev/null 2>&1; then has_az=true; else has_az=false; fi
+
+# --- output -----------------------------------------------------------------
+
+printf 'repo_root=%s\n'      "$root"
+printf 'branch=%s\n'         "$branch"
+printf 'default_branch=%s\n' "$default_branch"
+printf 'tree_clean=%s\n'     "$tree_clean"
+printf 'stack=%s\n'          "$stack"
+printf 'test_cmd=%s\n'       "$test_cmd"
+printf 'build_cmd=%s\n'      "$build_cmd"
+printf 'lint_cmd=%s\n'       "$lint_cmd"
+printf 'remote_host=%s\n'    "$remote_host"
+printf 'has_gh=%s\n'         "$has_gh"
+printf 'has_az=%s\n'         "$has_az"

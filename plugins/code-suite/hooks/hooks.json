@@ -1,0 +1,17 @@
+{
+  "description": "Blocks git commit and git push when cs-secret-scan finds secrets in the changes.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/guard-commit.sh\"",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}

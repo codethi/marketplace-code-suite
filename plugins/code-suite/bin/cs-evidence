@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# cs-evidence — per-task journal and evidence ledger kept under .code-suite/<slug>/.
+#
+# Usage:
+#   cs-evidence init   <slug>
+#   cs-evidence note   <slug> "text"
+#   cs-evidence record <slug> <type> <pass|fail> "note"
+#   cs-evidence show   <slug>
+#   cs-evidence verify <slug> [--high-risk]
+#
+# Works from any subdirectory of a git repository. Needs only git and
+# standard utilities. .code-suite/ is added to .git/info/exclude, so the
+# ledger never dirties the working tree.
+#
+# evidence.log format, one line per record:
+#   date|type|status|HEAD sha|note
+#
+# verify exits 0 only when every required type (tests, review, diff-review,
+# secrets, plus security-review with --high-risk) has its latest record with
+# status pass on the current HEAD, and the tree is clean; otherwise 1.
+# Usage errors exit 2.
+
+set -u
+
+export GIT_OPTIONAL_LOCKS=0
+
+REQUIRED_TYPES="tests review diff-review secrets"
+HIGH_RISK_TYPES="security-review"
+
+die()   { echo "cs-evidence: $*" >&2; exit 1; }
+usage() {
+  sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//' >&2
+  exit 2
+}
+
+now() { date +%Y-%m-%dT%H:%M:%S%z; }
+
+# Replaces pipes with "/" and line breaks/tabs with spaces.
+sanitize() { printf '%s' "$1" | tr '|\r\n\t' '/   '; }
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || die "não está dentro de um repositório git"
+
+check_slug() {
+  case "$1" in
+    ""|.*|*[!A-Za-z0-9._-]*) die "slug inválido '$1' (use letras, dígitos, '.', '_' ou '-', sem começar com '.')" ;;
+  esac
+}
+
+task_dir() { printf '%s/.code-suite/%s' "$root" "$1"; }
+
+require_task() {
+  [ -d "$(task_dir "$1")" ] || die "tarefa '$1' não existe; rode: cs-evidence init $1"
+}
+
+head_sha() { git -C "$root" rev-parse --verify -q HEAD 2>/dev/null; }
+
+# Prints the latest evidence line for each type, in order of first appearance.
+latest_per_type() {
+  local log="$1"
+  [ -f "$log" ] || return 0
+  awk -F '|' 'NF >= 4 {
+    if (!($2 in last)) order[++n] = $2
+    last[$2] = $0
+  } END { for (i = 1; i <= n; i++) print last[order[i]] }' "$log"
+}
+
+latest_of() {
+  local log="$1" type="$2"
+  [ -f "$log" ] || return 0
+  awk -F '|' -v t="$type" '$2 == t { line = $0 } END { if (line != "") print line }' "$log"
+}
+
+# --- commands ---------------------------------------------------------------
+
+cmd_init() {
+  [ $# -eq 1 ] || usage
+  check_slug "$1"
+  local dir exclude
+  dir=$(task_dir "$1")
+  mkdir -p "$dir" || die "não foi possível criar $dir"
+
+  exclude=$(git -C "$root" rev-parse --git-path info/exclude) || die "não foi possível localizar info/exclude"
+  case "$exclude" in /*) ;; *) exclude="$root/$exclude" ;; esac
+  mkdir -p "$(dirname "$exclude")"
+  if ! grep -qxF '.code-suite/' "$exclude" 2>/dev/null; then
+    printf '.code-suite/\n' >> "$exclude" || die "não foi possível escrever em $exclude"
+  fi
+
+  if [ ! -f "$dir/journal.md" ]; then
+    printf '# %s\n\n' "$1" > "$dir/journal.md"
+    printf -- '- %s — tarefa iniciada\n' "$(now)" >> "$dir/journal.md"
+  fi
+  echo "$dir"
+}
+
+cmd_note() {
+  [ $# -eq 2 ] || usage
+  check_slug "$1"; require_task "$1"
+  [ -n "$2" ] || die "texto vazio"
+  printf -- '- %s — %s\n' "$(now)" "$(sanitize "$2")" >> "$(task_dir "$1")/journal.md"
+}
+
+cmd_record() {
+  [ $# -eq 4 ] || usage
+  check_slug "$1"; require_task "$1"
+  local type="$2" status="$3" note sha
+  case "$type" in ""|*[!A-Za-z0-9._-]*) die "tipo inválido '$type'" ;; esac
+  case "$status" in pass|fail) ;; *) die "status deve ser pass ou fail, não '$status'" ;; esac
+  sha=$(head_sha) || die "o repositório ainda não tem commits"
+  note=$(sanitize "$4")
+  printf '%s|%s|%s|%s|%s\n' "$(now)" "$type" "$status" "$sha" "$note" >> "$(task_dir "$1")/evidence.log"
+}
+
+cmd_show() {
+  [ $# -eq 1 ] || usage
+  check_slug "$1"; require_task "$1"
+  local log sha lines
+  log="$(task_dir "$1")/evidence.log"
+  sha=$(head_sha) || sha=""
+  lines=$(latest_per_type "$log")
+  if [ -z "$lines" ]; then
+    echo "nenhuma evidência registrada para '$1'"
+    return 0
+  fi
+  printf '%s\n' "$lines" | awk -F '|' -v head="$sha" '
+    BEGIN { printf "%-18s %-6s %-9s %s\n", "TIPO", "STATUS", "COMMIT", "SITUAÇÃO" }
+    { printf "%-18s %-6s %-9s %s\n", $2, $3, substr($4, 1, 7), ($4 == head ? "atual" : "DESATUALIZADA") }'
+}
+
+cmd_verify() {
+  local slug="" high_risk=false arg
+  for arg in "$@"; do
+    case "$arg" in
+      --high-risk) high_risk=true ;;
+      -*)          usage ;;
+      *)           [ -z "$slug" ] || usage; slug="$arg" ;;
+    esac
+  done
+  [ -n "$slug" ] || usage
+  check_slug "$slug"; require_task "$slug"
+
+  local log sha types type line status esha problems=0 dirty
+  log="$(task_dir "$slug")/evidence.log"
+  sha=$(head_sha) || die "o repositório ainda não tem commits"
+  types=$REQUIRED_TYPES
+  $high_risk && types="$types $HIGH_RISK_TYPES"
+
+  echo "verificando '$slug' em ${sha:0:7}$($high_risk && echo ' (alto risco)')"
+  for type in $types; do
+    line=$(latest_of "$log" "$type")
+    if [ -z "$line" ]; then
+      printf '  %-18s AUSENTE\n' "$type"; problems=$((problems + 1)); continue
+    fi
+    status=$(printf '%s' "$line" | cut -d '|' -f 3)
+    esha=$(printf '%s' "$line" | cut -d '|' -f 4)
+    if [ "$esha" != "$sha" ]; then
+      printf '  %-18s DESATUALIZADA (registrada em %s)\n' "$type" "${esha:0:7}"; problems=$((problems + 1))
+    elif [ "$status" != "pass" ]; then
+      printf '  %-18s FALHOU\n' "$type"; problems=$((problems + 1))
+    else
+      printf '  %-18s ok\n' "$type"
+    fi
+  done
+
+  dirty=$(git -C "$root" --no-optional-locks status --porcelain 2>/dev/null)
+  if [ -n "$dirty" ]; then
+    printf '  árvore git         SUJA\n'
+    printf '%s\n' "$dirty" | sed 's/^/      /'
+    problems=$((problems + 1))
+  else
+    printf '  árvore git         limpa\n'
+  fi
+
+  if [ "$problems" -gt 0 ]; then
+    echo "BLOQUEADO: $problems problema(s)" >&2
+    exit 1
+  fi
+  echo "OK: todas as evidências estão atuais e aprovadas"
+}
+
+# --- dispatch ---------------------------------------------------------------
+
+[ $# -ge 1 ] || usage
+cmd=$1; shift
+case "$cmd" in
+  init)   cmd_init "$@" ;;
+  note)   cmd_note "$@" ;;
+  record) cmd_record "$@" ;;
+  show)   cmd_show "$@" ;;
+  verify) cmd_verify "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage ;;
+esac
